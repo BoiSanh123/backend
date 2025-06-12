@@ -299,6 +299,21 @@ router.get('/drivers', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+// lấy 1 tài xế cụ thể
+router.get('/staff/:StaffID', async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT Name, Position FROM Staff WHERE StaffID = ?',
+      [req.params.StaffID]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('[❌ ERROR /staff/:id]:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 
 // Gán đơn cho tài xế (khi bấm nút "Phân bố")
 router.post('/orders/:orderId/assign', async (req, res) => {
@@ -341,7 +356,6 @@ router.get('/drivers/:StaffID/assigned-count', async (req, res) => {
 });
 
 // Lấy đơn hàng đã phân bố theo driver cho DriverAssignedOrders
-
 router.get('/drivers/:StaffID/assigned-orders', async (req, res) => {
   try {
     const [rows] = await db.execute(`
@@ -356,7 +370,8 @@ router.get('/drivers/:StaffID/assigned-orders', async (req, res) => {
         c.Name AS Receiver_name,
         c.Phone AS Receiver_phone,
         CONCAT(c.Street, ', ', c.Ward, ', ', c.District, ', ', c.City) AS Receiver_address,
-        t.Timestamp AS assigned_at
+        t.Timestamp AS assigned_at,
+        o.Updated_at
       FROM Tracking t
       JOIN \`Order\` o ON t.Order_id = o.OrderID
       JOIN Package p ON o.OrderID = p.Order_id
