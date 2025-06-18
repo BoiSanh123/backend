@@ -51,6 +51,8 @@ router.post('/orders', async (req, res) => {
   }
 }); */
 
+// API lấy đơn cho AssignPickupScreen.js
+// Nhớ thêm bất kỳ status mới nào cần loại trừ
 router.get('/orders', async (req, res) => {
   try {
     const [rows] = await db.execute(`
@@ -68,6 +70,17 @@ router.get('/orders', async (req, res) => {
       LEFT JOIN Customer sender ON o.Sender_id = sender.CustomerID
       LEFT JOIN Package p ON o.OrderID = p.Order_id
       LEFT JOIN Customer receiver ON p.Receiver_id = receiver.CustomerID
+      WHERE o.OrderID NOT IN (
+        SELECT t.Order_id 
+        FROM Tracking t
+        INNER JOIN (
+          SELECT Order_id, MAX(Timestamp) as LatestTime
+          FROM Tracking
+          GROUP BY Order_id
+        ) latest ON t.Order_id = latest.Order_id AND t.Timestamp = latest.LatestTime
+        WHERE t.Status IN ('Cần lấy', 'Đang lấy', 'Đã lấy', 'Đã tiếp nhận', 'Đang xử lý', 'Đang vận chuyển') 
+      )
+      AND o.Order_status = 'Mới tạo'
     `);
     res.json(rows);
   } catch (err) {
@@ -75,20 +88,6 @@ router.get('/orders', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
-
-
-
-/*
-router.get('/orders', async (req, res) => {
-  try {
-    const [rows] = await db.execute('SELECT * FROM `Order`');
-    res.json(rows);
-  } catch (err) {
-    console.error('[❌ ERROR GET /orders]:', err);
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
-}); 
-*/
 
 // 2. Lấy danh sách đơn hàng của một khách hàng
 router.get('/orders/customer/:customerId', async (req, res) => {
@@ -200,26 +199,26 @@ router.get('/tracking', async (req, res) => {
   }
 });
 
-// Tạo gói hàng + Cập nhật phí vận chuyển (cho WarehouseScreen lấy api đã lưu Trong WarehouseProcessingScreen)
+// Cập nhật phí vận chuyển (cho WarehouseScreen lấy api đã lưu Trong WarehouseProcessingScreen)
 router.post('/orders/:orderId/package', async (req, res) => {
   const connection = await db.getConnection();
   try {
-    const {
-      weight,
-      dimensions,
-      value, // không dùng
-      current_warehouse_id,
-      sender_id,
-      receiver_id,
-      service_id,
-      ship_cost
-    } = req.body;
-
+    const { weight, dimensions, current_warehouse_id, ship_cost, item_value = 0 } = req.body;
     const dimensionStr = `${dimensions.length}x${dimensions.width}x${dimensions.height}`;
 
     await connection.beginTransaction();
 
-    // 1. Tạo gói hàng trong bảng Package
+    // 1. Lấy thông tin order
+    const [order] = await connection.execute(
+      `SELECT Sender_id, Receiver_id, Service_id FROM \`Order\` WHERE OrderID = ?`,
+      [req.params.orderId]
+    );
+
+    if (!order.length) {
+      throw new Error('Không tìm thấy đơn hàng');
+    }
+
+    // 2. Tạo package
     const [packageResult] = await connection.execute(
       `INSERT INTO Package (
         Order_id, Sender_id, Receiver_id, Service_id,
@@ -227,17 +226,17 @@ router.post('/orders/:orderId/package', async (req, res) => {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Đang xử lý')`,
       [
         req.params.orderId,
-        sender_id,
-        receiver_id,
-        service_id,
-        weight,
+        order[0].Sender_id,
+        order[0].Receiver_id,
+        order[0].Service_id,
+        parseFloat(weight),
         dimensionStr,
-        value,
+        parseFloat(item_value),
         current_warehouse_id || null
       ]
     );
 
-    // 2. Cập nhật phí vận chuyển vào bảng Order
+    // 3. Cập nhật phí vận chuyển
     await connection.execute(
       `UPDATE \`Order\` SET Ship_cost = ? WHERE OrderID = ?`,
       [ship_cost, req.params.orderId]
@@ -246,38 +245,44 @@ router.post('/orders/:orderId/package', async (req, res) => {
     await connection.commit();
 
     res.json({
-      message: '✅ Đã lưu gói hàng và cập nhật phí vận chuyển',
+      message: 'Đã xử lý đơn hàng thành công',
       packageId: packageResult.insertId
     });
   } catch (err) {
     await connection.rollback();
-    console.error('[❌ ERROR /orders/:id/package]:', err);
-    res.status(500).json({ error: 'Internal Server Error' });
+    console.error('Xử lý đơn hàng thất bại:', err);
+    res.status(500).json({
+      error: err.message || 'Lỗi server khi xử lý đơn hàng'
+    });
   } finally {
     connection.release();
   }
 });
 
-// GET /orders/processed là cho WarehouseScreen.js
+// Cho WarehouseScreen.js
 router.get('/orders/processed', async (req, res) => {
+  const { warehouseId } = req.query;
+
   try {
     const [rows] = await db.execute(`
       SELECT 
         o.OrderID,
         o.Order_code,
-        o.Sender_id,
+        o.Order_status,
         c.Name AS Sender_name,
         s.Service_name,
         p.Weight,
-        p.Dimensions,
-        p.Value,
-        o.Ship_cost
+        p.Status AS Package_status
       FROM \`Order\` o
-      LEFT JOIN Customer c ON o.Sender_id = c.CustomerID
-      LEFT JOIN Service s ON o.Service_id = s.Service_id
-      INNER JOIN Package p ON o.OrderID = p.Order_id
-      WHERE o.Order_status != 'Mới tạo'
-    `);
+      JOIN Customer c ON o.Sender_id = c.CustomerID
+      JOIN Service s ON o.Service_id = s.Service_id
+      JOIN Package p ON o.OrderID = p.Order_id
+      WHERE 
+        o.Order_status = 'Mới tạo' AND
+        p.Status = 'Đang xử lý' AND
+        p.Current_Warehouse_id = ?
+    `, [warehouseId]);
+
     res.json(rows);
   } catch (err) {
     console.error('[❌ ERROR GET /orders/processed]:', err);
@@ -299,6 +304,7 @@ router.get('/drivers', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+
 // lấy 1 tài xế cụ thể
 router.get('/staff/:StaffID', async (req, res) => {
   try {
@@ -317,23 +323,33 @@ router.get('/staff/:StaffID', async (req, res) => {
 
 // Gán đơn cho tài xế (khi bấm nút "Phân bố")
 router.post('/orders/:orderId/assign', async (req, res) => {
-  const { StaffID } = req.body;
+  const { StaffID, warehouseId } = req.body;
+  const connection = await db.getConnection();
 
   try {
-    await db.execute(`
-      INSERT INTO Tracking (Order_id, Staff_id, Status, Location, Timestamp)
-      VALUES (?, ?, 'Đã tiếp nhận', 'Kho hiện tại', NOW())
-    `, [req.params.orderId, StaffID]);
-    // Cập nhật trạng thái đơn
-    await db.execute(`
-      UPDATE \`Order\` SET Order_status = 'Đang giao'
-      WHERE OrderID = ?
+    await connection.beginTransaction();
+
+    // 1. Cập nhật TRACKING
+    await connection.execute(`
+      INSERT INTO Tracking (Order_id, Staff_id, Status, Timestamp, Location_id)
+      VALUES (?, ?, 'Đang vận chuyển', NOW(), ?)
+    `, [req.params.orderId, StaffID, warehouseId]);
+
+    // 2. Cập nhật PACKAGE
+    await connection.execute(`
+      UPDATE Package
+      SET Status = 'Đang giao'
+      WHERE Order_id = ?
     `, [req.params.orderId]);
 
-    res.json({ message: '✅ Đã phân bố đơn hàng cho tài xế' });
+    await connection.commit();
+    res.json({ message: 'Đã giao đơn cho tài xế' });
   } catch (err) {
+    await connection.rollback();
     console.error('[❌ ERROR /orders/:orderId/assign]:', err);
     res.status(500).json({ error: 'Internal Server Error' });
+  } finally {
+    connection.release();
   }
 });
 
@@ -344,8 +360,11 @@ router.get('/drivers/:StaffID/assigned-count', async (req, res) => {
 
     const [rows] = await db.execute(`
       SELECT COUNT(*) AS count
-      FROM Tracking
-      WHERE Staff_id = ?
+      FROM Tracking t
+      JOIN \`Order\` o ON t.Order_id = o.OrderID
+      WHERE t.Staff_id = ?
+      AND o.Order_status = 'Mới tạo'
+      AND t.Status = 'Đang vận chuyển'
     `, [StaffID]);
 
     res.json({ count: rows[0].count });
@@ -355,7 +374,7 @@ router.get('/drivers/:StaffID/assigned-count', async (req, res) => {
   }
 });
 
-// Lấy đơn hàng đã phân bố theo driver cho DriverAssignedOrders
+// Lấy đơn hàng đã phân bố theo driver cho DriverAssignedOrders và DeliveryOrdersScreen
 router.get('/drivers/:StaffID/assigned-orders', async (req, res) => {
   try {
     const [rows] = await db.execute(`
@@ -371,13 +390,18 @@ router.get('/drivers/:StaffID/assigned-orders', async (req, res) => {
         c.Phone AS Receiver_phone,
         CONCAT(c.Street, ', ', c.Ward, ', ', c.District, ', ', c.City) AS Receiver_address,
         t.Timestamp AS assigned_at,
-        o.Updated_at
+        o.Updated_at,
+        w.WarehouseID,
+        w.Name AS Warehouse_name
       FROM Tracking t
       JOIN \`Order\` o ON t.Order_id = o.OrderID
       JOIN Package p ON o.OrderID = p.Order_id
       JOIN Customer c ON p.Receiver_id = c.CustomerID
-      JOIN Service s ON o.Service_id = s.Service_id  
+      JOIN Service s ON o.Service_id = s.Service_id
+      JOIN Warehouse w ON t.Location = w.Name
       WHERE t.Staff_id = ?
+        AND o.Order_status = 'Mới tạo'
+        AND t.Status = 'Đang vận chuyển'
       ORDER BY t.Timestamp DESC
     `, [req.params.StaffID]);
 
@@ -439,6 +463,248 @@ router.put('/orders/:orderId/unassign', async (req, res) => {
     connection.release();
   }
 });
+
+// gán đơn cho tài xế lấy đơn về kho
+router.post('/delivery-assignments', async (req, res) => {
+  try {
+    const { OrderID, StaffID, IsPickup } = req.body;
+
+    const [assignmentResult] = await db.execute(
+      'INSERT INTO DeliveryAssignment (OrderID, DriverID, IsPickup) VALUES (?, ?, ?)',
+      [OrderID, StaffID, IsPickup]
+    );
+
+    await db.execute(
+      'INSERT INTO Tracking (Order_id, Staff_id, Status, Timestamp) VALUES (?, ?, ?, NOW())',
+      [OrderID, StaffID, 'Cần lấy']
+    );
+
+    res.json({ success: true, assignmentId: assignmentResult.insertId });
+  } catch (err) {
+    console.error('[❌ ERROR POST /delivery-assignments]:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Lấy đơn đã gán cho tài xế lấy đơn về kho
+router.get('/driver-pickup-orders', async (req, res) => {
+  try {
+    const { driverId } = req.query;
+
+    const [rows] = await db.execute(`
+      SELECT 
+        da.AssignmentID,
+        da.OrderID,
+        da.DriverID,
+        o.Order_code, 
+        o.Order_status,
+        o.Created_at,
+        o.Ship_cost,
+        c.Name AS Sender_name,
+        c.Phone AS Sender_phone,
+        CONCAT(c.Street, ', ', c.Ward, ', ', c.District, ', ', c.City) AS Sender_address,
+        s.Service_name,
+        s.Service_id
+      FROM DeliveryAssignment da
+      JOIN \`Order\` o ON da.OrderID = o.OrderID
+      JOIN Customer c ON o.Sender_id = c.CustomerID
+      JOIN Service s ON o.Service_id = s.Service_id
+      WHERE da.DriverID = ? 
+      AND da.IsPickup = 1
+      AND o.OrderID IN (
+        SELECT t.Order_id 
+        FROM Tracking t
+        INNER JOIN (
+          SELECT Order_id, MAX(Timestamp) as LatestTime
+          FROM Tracking
+          GROUP BY Order_id
+        ) latest ON t.Order_id = latest.Order_id AND t.Timestamp = latest.LatestTime
+        WHERE t.Status = 'Cần lấy'
+      )
+    `, [driverId]);
+
+    res.json(rows);
+  } catch (err) {
+    console.error('[❌ ERROR GET /driver-pickup-orders]:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Lấy danh sách đơn "Đã lấy" thành công bởi tài xế
+router.get('/driver-completed-pickups', async (req, res) => {
+  try {
+    const { driverId } = req.query;
+
+    const [rows] = await db.execute(`
+      SELECT 
+        o.OrderID,
+        o.Order_code,
+        o.Order_status,
+        o.Ship_cost,
+        c.Name AS Sender_name,
+        c.Phone AS Sender_phone,
+        CONCAT(c.Street, ', ', c.Ward, ', ', c.District, ', ', c.City) AS Sender_address,
+        s.Service_name,
+        t.Timestamp AS completed_at
+      FROM \`Order\` o
+      JOIN Customer c ON o.Sender_id = c.CustomerID
+      JOIN Service s ON o.Service_id = s.Service_id
+      JOIN (
+        SELECT Order_id, MAX(Timestamp) as Timestamp 
+        FROM Tracking 
+        GROUP BY Order_id
+      ) t ON o.OrderID = t.Order_id
+      WHERE o.OrderID IN (
+        SELECT Order_id FROM Tracking 
+        WHERE Staff_id = ? AND Status = 'Đã lấy'
+      )
+    `, [driverId]);
+
+    res.json(rows);
+  } catch (err) {
+    console.error('[❌ ERROR GET /driver-completed-pickups]:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Kiểm tra trạng thái Tracking có "Đang lấy" không
+router.get('/driver-active-pickup', async (req, res) => {
+  try {
+    const { driverId } = req.query;
+
+    const [rows] = await db.execute(`
+      SELECT 
+        o.OrderID,
+        o.Order_code,
+        o.Order_status,
+        c.Name AS Sender_name,
+        c.Phone AS Sender_phone,
+        CONCAT(c.Street, ', ', c.Ward, ', ', c.District, ', ', c.City) AS Sender_address,
+        s.Service_name
+      FROM \`Order\` o
+      JOIN Customer c ON o.Sender_id = c.CustomerID
+      JOIN Service s ON o.Service_id = s.Service_id
+      WHERE o.OrderID IN (
+        SELECT t.Order_id 
+        FROM Tracking t
+        INNER JOIN (
+          SELECT Order_id, MAX(Timestamp) as LatestTime
+          FROM Tracking
+          GROUP BY Order_id
+        ) latest ON t.Order_id = latest.Order_id AND t.Timestamp = latest.LatestTime
+        WHERE t.Status = 'Đang lấy' AND t.Staff_id = ?
+      )
+      LIMIT 1
+    `, [driverId]);
+
+    res.json(rows[0] || null);
+  } catch (err) {
+    console.error('[❌ ERROR GET /driver-active-pickup]:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Cập nhật trạng thái Tracking
+router.post('/update-tracking', async (req, res) => {
+  try {
+    const { orderId, staffId, status } = req.body;
+
+    await db.execute(
+      'INSERT INTO Tracking (Order_id, Staff_id, Status, Timestamp) VALUES (?, ?, ?, NOW())',
+      [orderId, staffId, status]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[❌ ERROR POST /update-tracking]:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// lấy danh sách đơn hàng "Mới tạo" có trạng thái tracking mới nhất là "Đã tiếp nhận", lọc dựa theo kho
+router.get('/warehouse-new-orders', async (req, res) => {
+  const { warehouseId } = req.query;
+
+  try {
+    const [rows] = await db.execute(`
+      SELECT 
+        o.*, 
+        s.Service_name,
+        CONCAT(sender.Street, ', ', sender.Ward, ', ', sender.District, ', ', sender.City) AS Sender_address,
+        CONCAT(receiver.Street, ', ', receiver.Ward, ', ', receiver.District, ', ', receiver.City) AS Receiver_address
+      FROM \`Order\` o
+      JOIN Service s ON o.Service_id = s.Service_id
+      JOIN Customer sender ON o.Sender_id = sender.CustomerID
+      JOIN Package p ON p.Order_id = o.OrderID
+      JOIN Customer receiver ON p.Receiver_id = receiver.CustomerID
+      WHERE o.Order_status = 'Mới tạo'
+        AND p.Current_Warehouse_id = ?
+        AND o.OrderID IN (
+          SELECT t.Order_id 
+          FROM Tracking t
+          INNER JOIN (
+            SELECT Order_id, MAX(Timestamp) AS LatestTime
+            FROM Tracking
+            GROUP BY Order_id
+          ) latest ON t.Order_id = latest.Order_id AND t.Timestamp = latest.LatestTime
+          WHERE t.Status = 'Đã tiếp nhận'
+        )
+    `, [warehouseId]);
+
+    res.json(rows);
+  } catch (err) {
+    console.error('[❌ ERROR GET /warehouse-new-orders]:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Lấy dannh sách kho
+router.get('/warehouses', async (req, res) => {
+  try {
+    const [rows] = await db.execute(`
+      SELECT WarehouseID, Name FROM Warehouse
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error('[❌ ERROR GET /warehouses]:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Cập nhật kho hiện tại của package
+router.post('/deliver-to-warehouse', async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const { orderId, warehouseId, staffId } = req.body;
+
+    await connection.beginTransaction();
+
+    // 1. Cập nhật package sang kho mới
+    await connection.execute(
+      `UPDATE Package 
+       SET Current_Warehouse_id = ?, Status = 'Đang xử lý'
+       WHERE Order_id = ?`,
+      [warehouseId, orderId]
+    );
+
+    // 2. Thêm bản ghi tracking
+    await connection.execute(
+      `INSERT INTO Tracking (Order_id, Staff_id, Status, Timestamp, Location_id)
+       VALUES (?, ?, 'Đã tiếp nhận', NOW(), ?)`,
+      [orderId, staffId, warehouseId]
+    );
+
+    await connection.commit();
+    res.json({ message: 'Đã chuyển hàng về kho thành công' });
+  } catch (err) {
+    await connection.rollback();
+    console.error('Lỗi chuyển hàng về kho:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    connection.release();
+  }
+});
+
 
 // POST /shipping/calculate
 const {
