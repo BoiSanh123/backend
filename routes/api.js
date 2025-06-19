@@ -78,7 +78,7 @@ router.get('/orders', async (req, res) => {
           FROM Tracking
           GROUP BY Order_id
         ) latest ON t.Order_id = latest.Order_id AND t.Timestamp = latest.LatestTime
-        WHERE t.Status IN ('Cần lấy', 'Đang lấy', 'Đã lấy', 'Đã tiếp nhận', 'Đang xử lý', 'Đang vận chuyển') 
+        WHERE t.Status IN ('Cần lấy', 'Đang lấy', 'Đã lấy', 'Đã tiếp nhận', 'Đã xử lý', 'Đang vận chuyển') 
       )
       AND o.Order_status = 'Mới tạo'
     `);
@@ -199,7 +199,7 @@ router.get('/tracking', async (req, res) => {
   }
 });
 
-// Cập nhật phí vận chuyển (cho WarehouseScreen lấy api đã lưu Trong WarehouseProcessingScreen)
+// Cập nhật phí vận chuyển Trong WarehouseProcessingScreen
 router.post('/orders/:orderId/package', async (req, res) => {
   const connection = await db.getConnection();
   try {
@@ -210,13 +210,15 @@ router.post('/orders/:orderId/package', async (req, res) => {
 
     // 1. Lấy thông tin order
     const [order] = await connection.execute(
-      `SELECT Sender_id, Receiver_id, Service_id FROM \`Order\` WHERE OrderID = ?`,
+      `SELECT Sender_id, Service_id FROM \`Order\` WHERE OrderID = ?`,
       [req.params.orderId]
     );
 
     if (!order.length) {
       throw new Error('Không tìm thấy đơn hàng');
     }
+
+    const senderId = order[0].Sender_id;
 
     // 2. Tạo package
     const [packageResult] = await connection.execute(
@@ -240,6 +242,17 @@ router.post('/orders/:orderId/package', async (req, res) => {
     await connection.execute(
       `UPDATE \`Order\` SET Ship_cost = ? WHERE OrderID = ?`,
       [ship_cost, req.params.orderId]
+    );
+
+    // 4. Ghi Tracking: "Đã xử lý"
+    await connection.execute(
+      `INSERT INTO Tracking (Order_id, Staff_id, Status, Timestamp, Location_id)
+       VALUES (?, ?, 'Đã xử lý', NOW(), ?)`,
+      [
+        req.params.orderId,
+        senderId, // Tạm gắn sender làm staff xử lý, bạn có thể đổi thành staff thực tế đang xử lý nếu có
+        current_warehouse_id
+      ]
     );
 
     await connection.commit();
@@ -277,10 +290,19 @@ router.get('/orders/processed', async (req, res) => {
       JOIN Customer c ON o.Sender_id = c.CustomerID
       JOIN Service s ON o.Service_id = s.Service_id
       JOIN Package p ON o.OrderID = p.Order_id
+      JOIN (
+        SELECT t1.Order_id, t1.Status
+        FROM Tracking t1
+        INNER JOIN (
+          SELECT Order_id, MAX(Timestamp) AS LatestTime
+          FROM Tracking
+          GROUP BY Order_id
+        ) t2 ON t1.Order_id = t2.Order_id AND t1.Timestamp = t2.LatestTime
+      ) t ON o.OrderID = t.Order_id
       WHERE 
         o.Order_status = 'Mới tạo' AND
-        p.Status = 'Đang xử lý' AND
-        p.Current_Warehouse_id = ?
+        p.Current_Warehouse_id = ? AND
+        t.Status = 'Đã xử lý'
     `, [warehouseId]);
 
     res.json(rows);
@@ -550,14 +572,19 @@ router.get('/driver-completed-pickups', async (req, res) => {
       JOIN Customer c ON o.Sender_id = c.CustomerID
       JOIN Service s ON o.Service_id = s.Service_id
       JOIN (
-        SELECT Order_id, MAX(Timestamp) as Timestamp 
-        FROM Tracking 
-        GROUP BY Order_id
+        SELECT t1.Order_id, t1.Status, t1.Timestamp
+        FROM Tracking t1
+        INNER JOIN (
+          SELECT Order_id, MAX(Timestamp) AS max_time
+          FROM Tracking
+          GROUP BY Order_id
+        ) t2 ON t1.Order_id = t2.Order_id AND t1.Timestamp = t2.max_time
       ) t ON o.OrderID = t.Order_id
-      WHERE o.OrderID IN (
-        SELECT Order_id FROM Tracking 
-        WHERE Staff_id = ? AND Status = 'Đã lấy'
-      )
+      WHERE t.Status = 'Đã lấy'
+        AND o.OrderID IN (
+          SELECT Order_id FROM Tracking 
+          WHERE Staff_id = ?
+        )
     `, [driverId]);
 
     res.json(rows);
@@ -682,14 +709,14 @@ router.post('/deliver-to-warehouse', async (req, res) => {
     // 1. Cập nhật package sang kho mới
     await connection.execute(
       `UPDATE Package 
-       SET Current_Warehouse_id = ?, Status = 'Đang xử lý'
+       SET Current_Warehouse_id = ?
        WHERE Order_id = ?`,
       [warehouseId, orderId]
     );
 
     // 2. Thêm bản ghi tracking
     await connection.execute(
-      `INSERT INTO Tracking (Order_id, Staff_id, Status, Timestamp, Location_id)
+      `INSERT INTO Tracking (Order_id, Staff_id, Status, Timestamp, Location)
        VALUES (?, ?, 'Đã tiếp nhận', NOW(), ?)`,
       [orderId, staffId, warehouseId]
     );
