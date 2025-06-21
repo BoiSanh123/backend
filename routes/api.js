@@ -51,8 +51,7 @@ router.post('/orders', async (req, res) => {
   }
 }); */
 
-// API lấy đơn cho AssignPickupScreen.js
-// Nhớ thêm bất kỳ status mới nào cần loại trừ
+// API lấy tất cả đơn từ người gửi cho AssignPickupScreen.js
 router.get('/orders', async (req, res) => {
   try {
     const [rows] = await db.execute(`
@@ -64,23 +63,26 @@ router.get('/orders', async (req, res) => {
         CONCAT(sender.Street, ', ', sender.Ward, ', ', sender.District, ', ', sender.City) AS Sender_address,
         receiver.Name AS Receiver_name,
         receiver.Phone AS Receiver_phone,
-        CONCAT(receiver.Street, ', ', receiver.Ward, ', ', receiver.District, ', ', receiver.City) AS Receiver_address
+        CONCAT(receiver.Street, ', ', receiver.Ward, ', ', receiver.District, ', ', receiver.City) AS Receiver_address,
+        t.Status AS tracking_status,
+        t.Timestamp AS tracking_time
       FROM \`Order\` o
       JOIN Service s ON o.Service_id = s.Service_id
       LEFT JOIN Customer sender ON o.Sender_id = sender.CustomerID
       LEFT JOIN Package p ON o.OrderID = p.Order_id
       LEFT JOIN Customer receiver ON p.Receiver_id = receiver.CustomerID
-      WHERE o.OrderID NOT IN (
-        SELECT t.Order_id 
-        FROM Tracking t
+      JOIN (
+        SELECT t1.Order_id, t1.Status, t1.Timestamp
+        FROM Tracking t1
         INNER JOIN (
           SELECT Order_id, MAX(Timestamp) as LatestTime
           FROM Tracking
           GROUP BY Order_id
-        ) latest ON t.Order_id = latest.Order_id AND t.Timestamp = latest.LatestTime
-        WHERE t.Status IN ('Cần lấy', 'Đang lấy', 'Đã lấy', 'Đã tiếp nhận', 'Đã xử lý', 'Đang vận chuyển') 
-      )
-      AND o.Order_status = 'Mới tạo'
+        ) latest ON t1.Order_id = latest.Order_id AND t1.Timestamp = latest.LatestTime
+      ) t ON o.OrderID = t.Order_id
+      WHERE 
+        o.Order_status = 'Mới tạo'
+        AND t.Status = 'Mới tạo'
     `);
     res.json(rows);
   } catch (err) {
@@ -104,6 +106,7 @@ router.get('/orders/customer/:customerId', async (req, res) => {
 });
 
 // 3. Cập nhật trạng thái đơn hàng dựa bảng Order 'Mới tạo', 'Đang giao', 'Hoàn thành', 'Thất bại'
+/*
 router.put('/orders/:orderId/status', async (req, res) => {
   try {
     const { newStatus } = req.body;
@@ -115,6 +118,41 @@ router.put('/orders/:orderId/status', async (req, res) => {
     );
 
     res.json({ message: 'Order status updated' });
+  } catch (err) {
+    console.error('[❌ ERROR /orders/:id/status]:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+*/
+router.put('/orders/:orderId/status', async (req, res) => {
+  try {
+    const { newStatus, notes, staffId, proof_image } = req.body;
+    console.log('[DEBUG] /orders/:id/status req.body:', req.body);
+
+    // 1. Cập nhật trạng thái đơn hàng
+    await db.execute(
+      'UPDATE `Order` SET Order_status = ? WHERE OrderID = ?',
+      [newStatus, req.params.orderId]
+    );
+
+    // 2. Chỉ thêm tracking nếu có staffId (tránh lỗi khi không có)
+    if (staffId) {
+      await db.execute(
+        `INSERT INTO Tracking (Order_id, Staff_id, Notes) 
+         VALUES (?, ?, ?)`,
+        [req.params.orderId, staffId, notes || null]
+      );
+    }
+
+    // 3. Xử lý ảnh xác nhận nếu có
+    if (proof_image && newStatus === 'Hoàn thành') {
+      await db.execute(
+        'UPDATE `Order` SET Proof_image = ? WHERE OrderID = ?',
+        [proof_image, req.params.orderId]
+      );
+    }
+
+    res.json({ message: 'Order status updated successfully' });
   } catch (err) {
     console.error('[❌ ERROR /orders/:id/status]:', err);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -342,7 +380,6 @@ router.get('/staff/:StaffID', async (req, res) => {
   }
 });
 
-
 // Gán đơn cho tài xế (khi bấm nút "Phân bố")
 router.post('/orders/:orderId/assign', async (req, res) => {
   const { StaffID, warehouseId } = req.body;
@@ -351,13 +388,19 @@ router.post('/orders/:orderId/assign', async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    // 1. Cập nhật TRACKING
-    await connection.execute(`
-      INSERT INTO Tracking (Order_id, Staff_id, Status, Timestamp, Location_id)
-      VALUES (?, ?, 'Đang vận chuyển', NOW(), ?)
-    `, [req.params.orderId, StaffID, warehouseId]);
+    // 1. Lấy tên kho từ warehouseId
+    const [warehouse] = await connection.execute(
+      'SELECT Name FROM Warehouse WHERE WarehouseID = ?', 
+      [warehouseId]
+    );
 
-    // 2. Cập nhật PACKAGE
+    // 2. Cập nhật TRACKING với tên kho
+    await connection.execute(`
+      INSERT INTO Tracking (Order_id, Staff_id, Status, Timestamp, Location)
+      VALUES (?, ?, 'Đang vận chuyển', NOW(), ?)
+    `, [req.params.orderId, StaffID, warehouse[0].Name]);
+
+    // 3. Cập nhật PACKAGE
     await connection.execute(`
       UPDATE Package
       SET Status = 'Đang giao'
@@ -381,13 +424,19 @@ router.get('/drivers/:StaffID/assigned-count', async (req, res) => {
     const StaffID = req.params.StaffID;
 
     const [rows] = await db.execute(`
-      SELECT COUNT(*) AS count
+      SELECT COUNT(DISTINCT t.Order_id) AS count
       FROM Tracking t
+      JOIN (
+        SELECT Order_id, MAX(Timestamp) AS latest_timestamp
+        FROM Tracking
+        WHERE Staff_id = ?
+        GROUP BY Order_id
+      ) latest ON t.Order_id = latest.Order_id AND t.Timestamp = latest.latest_timestamp
       JOIN \`Order\` o ON t.Order_id = o.OrderID
       WHERE t.Staff_id = ?
       AND o.Order_status = 'Mới tạo'
-      AND t.Status = 'Đang vận chuyển'
-    `, [StaffID]);
+      AND t.Status IN ('Cần lấy', 'Đang lấy', 'Đã lấy', 'Đang vận chuyển')
+    `, [StaffID, StaffID]);
 
     res.json({ count: rows[0].count });
   } catch (err) {
@@ -411,8 +460,9 @@ router.get('/drivers/:StaffID/assigned-orders', async (req, res) => {
         c.Name AS Receiver_name,
         c.Phone AS Receiver_phone,
         CONCAT(c.Street, ', ', c.Ward, ', ', c.District, ', ', c.City) AS Receiver_address,
-        t.Timestamp AS assigned_at,
-        o.Updated_at,
+        t.Timestamp,
+        t.Status AS Tracking_status,
+        t.Notes AS Tracking_notes,
         w.WarehouseID,
         w.Name AS Warehouse_name
       FROM Tracking t
@@ -422,8 +472,6 @@ router.get('/drivers/:StaffID/assigned-orders', async (req, res) => {
       JOIN Service s ON o.Service_id = s.Service_id
       JOIN Warehouse w ON t.Location = w.Name
       WHERE t.Staff_id = ?
-        AND o.Order_status = 'Mới tạo'
-        AND t.Status = 'Đang vận chuyển'
       ORDER BY t.Timestamp DESC
     `, [req.params.StaffID]);
 
@@ -508,56 +556,16 @@ router.post('/delivery-assignments', async (req, res) => {
   }
 });
 
-// Lấy đơn đã gán cho tài xế lấy đơn về kho
-router.get('/driver-pickup-orders', async (req, res) => {
+// Lấy tất cả đơn pickup đã được gán cho tài xế kèm status
+router.get('/driver-all-pickup-orders', async (req, res) => {
   try {
     const { driverId } = req.query;
 
-    const [rows] = await db.execute(`
-      SELECT 
-        da.AssignmentID,
-        da.OrderID,
-        da.DriverID,
-        o.Order_code, 
-        o.Order_status,
-        o.Created_at,
-        o.Ship_cost,
-        c.Name AS Sender_name,
-        c.Phone AS Sender_phone,
-        CONCAT(c.Street, ', ', c.Ward, ', ', c.District, ', ', c.City) AS Sender_address,
-        s.Service_name,
-        s.Service_id
-      FROM DeliveryAssignment da
-      JOIN \`Order\` o ON da.OrderID = o.OrderID
-      JOIN Customer c ON o.Sender_id = c.CustomerID
-      JOIN Service s ON o.Service_id = s.Service_id
-      WHERE da.DriverID = ? 
-      AND da.IsPickup = 1
-      AND o.OrderID IN (
-        SELECT t.Order_id 
-        FROM Tracking t
-        INNER JOIN (
-          SELECT Order_id, MAX(Timestamp) as LatestTime
-          FROM Tracking
-          GROUP BY Order_id
-        ) latest ON t.Order_id = latest.Order_id AND t.Timestamp = latest.LatestTime
-        WHERE t.Status = 'Cần lấy'
-      )
-    `, [driverId]);
+    if (!driverId) {
+      return res.status(400).json({ error: 'Thiếu thông tin driverId' });
+    }
 
-    res.json(rows);
-  } catch (err) {
-    console.error('[❌ ERROR GET /driver-pickup-orders]:', err);
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
-});
-
-// Lấy danh sách đơn "Đã lấy" thành công bởi tài xế
-router.get('/driver-completed-pickups', async (req, res) => {
-  try {
-    const { driverId } = req.query;
-
-    const [rows] = await db.execute(`
+    const [orders] = await db.execute(`
       SELECT 
         o.OrderID,
         o.Order_code,
@@ -567,29 +575,33 @@ router.get('/driver-completed-pickups', async (req, res) => {
         c.Phone AS Sender_phone,
         CONCAT(c.Street, ', ', c.Ward, ', ', c.District, ', ', c.City) AS Sender_address,
         s.Service_name,
-        t.Timestamp AS completed_at
+        t.Status AS tracking_status,
+        t.Timestamp AS status_time,
+        w.WarehouseID,
+        w.Name AS Warehouse_name
       FROM \`Order\` o
       JOIN Customer c ON o.Sender_id = c.CustomerID
       JOIN Service s ON o.Service_id = s.Service_id
       JOIN (
-        SELECT t1.Order_id, t1.Status, t1.Timestamp
+        -- Lấy trạng thái Tracking MỚI NHẤT của mỗi đơn
+        SELECT t1.Order_id, t1.Status, t1.Timestamp, t1.Staff_id, t1.Location
         FROM Tracking t1
         INNER JOIN (
-          SELECT Order_id, MAX(Timestamp) AS max_time
+          SELECT Order_id, MAX(Timestamp) AS latest_time
           FROM Tracking
           GROUP BY Order_id
-        ) t2 ON t1.Order_id = t2.Order_id AND t1.Timestamp = t2.max_time
+        ) t2 ON t1.Order_id = t2.Order_id AND t1.Timestamp = t2.latest_time
       ) t ON o.OrderID = t.Order_id
-      WHERE t.Status = 'Đã lấy'
-        AND o.OrderID IN (
-          SELECT Order_id FROM Tracking 
-          WHERE Staff_id = ?
-        )
+      LEFT JOIN Warehouse w ON t.Location = w.Name
+      WHERE 
+        o.Order_status = 'Mới tạo'  -- Chỉ lấy đơn chưa hoàn thành
+        AND t.Staff_id = ?          -- Chỉ lấy đơn của tài xế này
+      ORDER BY t.Timestamp DESC
     `, [driverId]);
 
-    res.json(rows);
+    res.json(orders);
   } catch (err) {
-    console.error('[❌ ERROR GET /driver-completed-pickups]:', err);
+    console.error('[❌ ERROR GET /driver-all-pickup-orders]:', err);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
@@ -658,7 +670,21 @@ router.get('/warehouse-new-orders', async (req, res) => {
         o.*, 
         s.Service_name,
         CONCAT(sender.Street, ', ', sender.Ward, ', ', sender.District, ', ', sender.City) AS Sender_address,
-        CONCAT(receiver.Street, ', ', receiver.Ward, ', ', receiver.District, ', ', receiver.City) AS Receiver_address
+        CONCAT(receiver.Street, ', ', receiver.Ward, ', ', receiver.District, ', ', receiver.City) AS Receiver_address,
+        (
+          SELECT t.Status 
+          FROM Tracking t
+          WHERE t.Order_id = o.OrderID
+          ORDER BY t.Timestamp DESC
+          LIMIT 1
+        ) AS latest_tracking_status,
+        (
+          SELECT t.Timestamp 
+          FROM Tracking t
+          WHERE t.Order_id = o.OrderID
+          ORDER BY t.Timestamp DESC
+          LIMIT 1
+        ) AS latest_tracking_timestamp
       FROM \`Order\` o
       JOIN Service s ON o.Service_id = s.Service_id
       JOIN Customer sender ON o.Sender_id = sender.CustomerID
@@ -666,16 +692,6 @@ router.get('/warehouse-new-orders', async (req, res) => {
       JOIN Customer receiver ON p.Receiver_id = receiver.CustomerID
       WHERE o.Order_status = 'Mới tạo'
         AND p.Current_Warehouse_id = ?
-        AND o.OrderID IN (
-          SELECT t.Order_id 
-          FROM Tracking t
-          INNER JOIN (
-            SELECT Order_id, MAX(Timestamp) AS LatestTime
-            FROM Tracking
-            GROUP BY Order_id
-          ) latest ON t.Order_id = latest.Order_id AND t.Timestamp = latest.LatestTime
-          WHERE t.Status = 'Đã tiếp nhận'
-        )
     `, [warehouseId]);
 
     res.json(rows);
@@ -684,6 +700,7 @@ router.get('/warehouse-new-orders', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+
 
 // Lấy dannh sách kho
 router.get('/warehouses', async (req, res) => {
@@ -732,6 +749,47 @@ router.post('/deliver-to-warehouse', async (req, res) => {
   }
 });
 
+// 
+router.get('/transfer-drivers', async (req, res) => {
+  try {
+    const [rows] = await db.execute(`
+      SELECT StaffID, Name, Phone
+      FROM Staff
+      WHERE Position = 'Lái xe'
+        AND Is_active = TRUE
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error('[❌ ERROR GET /transfer-drivers]:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// API gán đơn cho lái xe chuyển Kho
+router.post('/orders/:orderId/assign-transfer', async (req, res) => {
+  try {
+    const { StaffID, warehouseId, warehouseName, warehouseAddress } = req.body;
+
+    if (!StaffID || !warehouseId || !warehouseName || !warehouseAddress) {
+      return res.status(400).json({ error: 'Thiếu thông tin bắt buộc' });
+    }
+
+    await db.execute(`
+      INSERT INTO Tracking (Order_id, Staff_id, Status, Timestamp, Location, Notes)
+      VALUES (?, ?, 'Đang chuyển kho', NOW(), ?, ?)
+    `, [
+      req.params.orderId,
+      StaffID,
+      warehouseName,
+      `Địa chỉ kho đến: ${warehouseAddress}`
+    ]);
+
+    res.json({ message: 'Đã phân bố đơn cho lái xe chuyển kho' });
+  } catch (err) {
+    console.error('[❌ ERROR POST /orders/:orderId/assign-transfer]:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
 
 // POST /shipping/calculate
 const {
