@@ -106,45 +106,21 @@ router.get('/orders/customer/:customerId', async (req, res) => {
 });
 
 // 3. Cập nhật trạng thái đơn hàng dựa bảng Order 'Mới tạo', 'Đang giao', 'Hoàn thành', 'Thất bại'
-/*
-router.put('/orders/:orderId/status', async (req, res) => {
-  try {
-    const { newStatus } = req.body;
-    console.log('[DEBUG] /orders/:id/status req.body:', req.body);
-
-    await db.execute(
-      'UPDATE `Order` SET Order_status = ? WHERE OrderID = ?',
-      [newStatus, req.params.orderId]
-    );
-
-    res.json({ message: 'Order status updated' });
-  } catch (err) {
-    console.error('[❌ ERROR /orders/:id/status]:', err);
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
-});
-*/
 router.put('/orders/:orderId/status', async (req, res) => {
   try {
     const { newStatus, notes, staffId, proof_image } = req.body;
     console.log('[DEBUG] /orders/:id/status req.body:', req.body);
-
-    // 1. Cập nhật trạng thái đơn hàng
     await db.execute(
       'UPDATE `Order` SET Order_status = ? WHERE OrderID = ?',
       [newStatus, req.params.orderId]
     );
-
-    // 2. Chỉ thêm tracking nếu có staffId (tránh lỗi khi không có)
     if (staffId) {
       await db.execute(
-        `INSERT INTO Tracking (Order_id, Staff_id, Notes) 
-         VALUES (?, ?, ?)`,
+        `INSERT INTO Tracking (Order_id, Staff_id, Timestamp, Notes) 
+         VALUES (?, ?, NOW(), ?)`,
         [req.params.orderId, staffId, notes || null]
       );
     }
-
-    // 3. Xử lý ảnh xác nhận nếu có
     if (proof_image && newStatus === 'Hoàn thành') {
       await db.execute(
         'UPDATE `Order` SET Proof_image = ? WHERE OrderID = ?',
@@ -479,58 +455,6 @@ router.get('/drivers/:StaffID/assigned-orders', async (req, res) => {
   } catch (err) {
     console.error('[❌ ERROR GET /drivers/:StaffID/assigned-orders]:', err);
     res.status(500).json({ error: 'Internal Server Error' });
-  }
-});
-
-// Hủy phân bố đơn cho DriverAssignedOrders.js
-router.put('/orders/:orderId/unassign', async (req, res) => {
-  const connection = await db.getConnection();
-  try {
-    await connection.beginTransaction();
-
-    // 1. Kiểm tra trạng thái đơn hàng
-    const [order] = await connection.execute(
-      `SELECT Order_status FROM \`Order\` WHERE OrderID = ?`,
-      [req.params.orderId]
-    );
-
-    if (!order[0]) {
-      throw new Error('Đơn hàng không tồn tại');
-    }
-
-    if (order[0].Order_status === 'Đang giao') {
-      throw new Error('Không thể hủy phân bố đơn hàng đang giao');
-    }
-
-    // 2. Cập nhật trạng thái đơn về "Đã hủy phân bố"
-    await connection.execute(
-      `UPDATE \`Order\` SET Order_status = 'Đã hủy phân bố' 
-       WHERE OrderID = ?`,
-      [req.params.orderId]
-    );
-
-    // 3. Thêm bản ghi tracking
-    await connection.execute(
-      `INSERT INTO Tracking (Order_id, Status, Timestamp, Notes)
-       VALUES (?, 'Đã hủy phân bố', NOW(), 'Hủy phân bố bởi tài xế')`,
-      [req.params.orderId]
-    );
-
-    // 4. Xóa liên kết với tài xế
-    await connection.execute(
-      `DELETE FROM Tracking 
-       WHERE Order_id = ? AND Status = 'Mới tạo'`,
-      [req.params.orderId]
-    );
-
-    await connection.commit();
-    res.json({ message: 'Đã hủy phân bố đơn hàng' });
-  } catch (err) {
-    await connection.rollback();
-    console.error('[❌ ERROR /orders/:orderId/unassign]:', err);
-    res.status(400).json({ error: err.message || 'Hủy phân bố thất bại' });
-  } finally {
-    connection.release();
   }
 });
 
